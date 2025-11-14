@@ -538,6 +538,357 @@ def ipadapter_execute(model,
 
     return (model, image)
 
+def ipadapter_execute_dual(model,
+                      ipadapter,
+                      clipvision,
+                      insightface=None,
+                      image=None,
+                      image_composition=None,
+                      image_negative=None,
+                      weight=1.0,
+                      weight_composition=1.0,
+                      weight_faceidv2=None,
+                      weight_kolors=1.0,
+                      weight_type="linear",
+                      combine_embeds="concat",
+                      start_at=0.0,
+                      end_at=1.0,
+                      attn_mask=None,
+                      pos_embed=None,
+                      neg_embed=None,
+                      unfold_batch=False,
+                      embeds_scaling='V only',
+                      layer_weights=None,
+                      encode_batch_size=0,
+                      style_boost=None,
+                      composition_boost=None,
+                      enhance_tiles=1,
+                      enhance_ratio=1.0,):
+    device = model_management.get_torch_device()
+    dtype = model_management.unet_dtype()
+    if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+        dtype = torch.float16 if model_management.should_use_fp16() else torch.float32
+
+    is_full = "proj.3.weight" in ipadapter["image_proj"]
+    is_portrait_unnorm = "portraitunnorm" in ipadapter
+    is_plus = (is_full or "latents" in ipadapter["image_proj"] or "perceiver_resampler.proj_in.weight" in ipadapter["image_proj"]) and not is_portrait_unnorm
+    output_cross_attention_dim = ipadapter["ip_adapter"]["1.to_k_ip.weight"].shape[1]
+    is_sdxl = output_cross_attention_dim == 2048
+    is_kwai_kolors_faceid = "perceiver_resampler.layers.0.0.to_out.weight" in ipadapter["image_proj"] and ipadapter["image_proj"]["perceiver_resampler.layers.0.0.to_out.weight"].shape[0] == 4096
+    is_faceidv2 = "faceidplusv2" in ipadapter or is_kwai_kolors_faceid
+    is_kwai_kolors = (is_sdxl and "layers.0.0.to_out.weight" in ipadapter["image_proj"] and ipadapter["image_proj"]["layers.0.0.to_out.weight"].shape[0] == 2048) or is_kwai_kolors_faceid
+    is_portrait = "proj.2.weight" in ipadapter["image_proj"] and not "proj.3.weight" in ipadapter["image_proj"] and not "0.to_q_lora.down.weight" in ipadapter["ip_adapter"] and not is_kwai_kolors_faceid
+    is_faceid = is_portrait or "0.to_q_lora.down.weight" in ipadapter["ip_adapter"] or is_portrait_unnorm or is_kwai_kolors_faceid
+
+    if is_faceid and not insightface:
+        raise Exception("insightface model is required for FaceID models")
+
+    if is_faceidv2:
+        weight_faceidv2 = weight_faceidv2 if weight_faceidv2 is not None else weight*2
+
+    if is_kwai_kolors_faceid:
+        cross_attention_dim = 4096
+    elif is_kwai_kolors:
+        cross_attention_dim = 2048
+    elif (is_plus and is_sdxl and not is_faceid) or is_portrait_unnorm:
+        cross_attention_dim = 1280
+    else:
+        cross_attention_dim = output_cross_attention_dim
+    
+    if is_kwai_kolors_faceid:
+        clip_extra_context_tokens = 6
+    elif (is_plus and not is_faceid) or is_portrait or is_portrait_unnorm:
+        clip_extra_context_tokens = 16
+    else:
+        clip_extra_context_tokens = 4
+
+    if image is not None and image.shape[1] != image.shape[2]:
+        print("\033[33mINFO: the IPAdapter reference image is not a square, CLIPImageProcessor will resize and crop it at the center. If the main focus of the picture is not in the middle the result might not be what you are expecting.\033[0m")
+
+    if isinstance(weight, list):
+        weight = torch.tensor(weight).unsqueeze(-1).unsqueeze(-1).to(device, dtype=dtype) if unfold_batch else weight[0]
+
+    if style_boost is not None:
+        weight_type = "style transfer precise"
+    elif composition_boost is not None:
+        weight_type = "composition precise"
+
+    # special weight types
+    if layer_weights is not None and layer_weights != '':
+        weight = { int(k): float(v)*weight for k, v in [x.split(":") for x in layer_weights.split(",")] }
+        weight_type = weight_type if weight_type == "style transfer precise" or weight_type == "composition precise" else "linear"
+    elif weight_type == "style transfer":
+        weight = { 6:weight } if is_sdxl else { 0:weight, 1:weight, 2:weight, 3:weight, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "composition":
+        weight = { 3:weight } if is_sdxl else { 4:weight*0.25, 5:weight }
+    elif weight_type == "strong style transfer":
+        if is_sdxl:
+            weight = { 0:weight, 1:weight, 2:weight, 4:weight, 5:weight, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "style and composition":
+        if is_sdxl:
+            weight = { 3:weight_composition, 6:weight }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition*0.25, 5:weight_composition, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "strong style and composition":
+        if is_sdxl:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight_composition, 4:weight, 5:weight, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition, 5:weight_composition, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "style transfer precise":
+        weight_composition = style_boost if style_boost is not None else weight
+        if is_sdxl:
+            weight = { 3:weight_composition, 6:weight }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition*0.25, 5:weight_composition, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "composition precise":
+        weight_composition = weight
+        weight = composition_boost if composition_boost is not None else weight
+        if is_sdxl:
+            weight = { 0:weight*.1, 1:weight*.1, 2:weight*.1, 3:weight_composition, 4:weight*.1, 5:weight*.1, 6:weight, 7:weight*.1, 8:weight*.1, 9:weight*.1, 10:weight*.1 }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition*0.25, 5:weight_composition, 6:weight*.1, 7:weight*.1, 8:weight*.1, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+
+    clipvision_size = 224 if not is_kwai_kolors else 336
+
+    img_comp_cond_embeds = None
+    face_cond_embeds = None
+    if is_faceid:
+        if insightface is None:
+            raise Exception("Insightface model is required for FaceID models")
+
+        from insightface.utils import face_align
+
+        insightface.det_model.input_size = (640,640) # reset the detection size
+        image_iface = tensor_to_image(image)
+        face_cond_embeds = []
+        image = []
+
+        for i in range(image_iface.shape[0]):
+            for size in [(size, size) for size in range(640, 256, -64)]:
+                insightface.det_model.input_size = size # TODO: hacky but seems to be working
+                face = insightface.get(image_iface[i])
+                if face:
+                    if not is_portrait_unnorm:
+                        face_cond_embeds.append(torch.from_numpy(face[0].normed_embedding).unsqueeze(0))
+                    else:
+                        face_cond_embeds.append(torch.from_numpy(face[0].embedding).unsqueeze(0))
+                    image.append(image_to_tensor(face_align.norm_crop(image_iface[i], landmark=face[0].kps, image_size=336 if is_kwai_kolors_faceid else 256 if is_sdxl else 224)))
+
+                    if 640 not in size:
+                        print(f"\033[33mINFO: InsightFace detection resolution lowered to {size}.\033[0m")
+                    break
+            else:
+                raise Exception('InsightFace: No face detected.')
+        face_cond_embeds = torch.stack(face_cond_embeds).to(device, dtype=dtype)
+        image = torch.stack(image)
+        del image_iface, face
+
+    if image is not None:
+        img_cond_embeds = encode_image_masked(clipvision, image, batch_size=encode_batch_size, tiles=enhance_tiles, ratio=enhance_ratio, clipvision_size=clipvision_size)
+        if image_composition is not None:
+            img_comp_cond_embeds = encode_image_masked(clipvision, image_composition, batch_size=encode_batch_size, tiles=enhance_tiles, ratio=enhance_ratio, clipvision_size=clipvision_size)
+
+        if is_plus:
+            img_cond_embeds = img_cond_embeds.penultimate_hidden_states
+            image_negative = image_negative if image_negative is not None else torch.zeros([1, clipvision_size, clipvision_size, 3])
+            img_uncond_embeds = encode_image_masked(clipvision, image_negative, batch_size=encode_batch_size, clipvision_size=clipvision_size).penultimate_hidden_states
+            if image_composition is not None:
+                img_comp_cond_embeds = img_comp_cond_embeds.penultimate_hidden_states
+        else:
+            img_cond_embeds = img_cond_embeds.image_embeds if not is_faceid else face_cond_embeds
+            if image_negative is not None and not is_faceid:
+                img_uncond_embeds = encode_image_masked(clipvision, image_negative, batch_size=encode_batch_size, clipvision_size=clipvision_size).image_embeds
+            else:
+                img_uncond_embeds = torch.zeros_like(img_cond_embeds)
+            if image_composition is not None:
+                img_comp_cond_embeds = img_comp_cond_embeds.image_embeds
+        del image_negative, image_composition
+
+        image = None if not is_faceid else image # if it's face_id we need the cropped face for later
+    elif pos_embed is not None:
+        img_cond_embeds = pos_embed
+
+        if neg_embed is not None:
+            img_uncond_embeds = neg_embed
+        else:
+            if is_plus:
+                img_uncond_embeds = encode_image_masked(clipvision, torch.zeros([1, clipvision_size, clipvision_size, 3]), clipvision_size=clipvision_size).penultimate_hidden_states
+            else:
+                img_uncond_embeds = torch.zeros_like(img_cond_embeds)
+        del pos_embed, neg_embed
+    else:
+        raise Exception("Images or Embeds are required")
+
+    # ensure that cond and uncond have the same batch size
+    img_uncond_embeds = tensor_to_size(img_uncond_embeds, img_cond_embeds.shape[0])
+
+    img_cond_embeds = img_cond_embeds.to(device, dtype=dtype)
+    img_uncond_embeds = img_uncond_embeds.to(device, dtype=dtype)
+    if img_comp_cond_embeds is not None:
+        img_comp_cond_embeds = img_comp_cond_embeds.to(device, dtype=dtype)
+
+    # combine the embeddings if needed
+    if combine_embeds != "concat" and img_cond_embeds.shape[0] > 1 and not unfold_batch:
+        if combine_embeds == "add":
+            img_cond_embeds = torch.sum(img_cond_embeds, dim=0).unsqueeze(0)
+            if face_cond_embeds is not None:
+                face_cond_embeds = torch.sum(face_cond_embeds, dim=0).unsqueeze(0)
+            if img_comp_cond_embeds is not None:
+                img_comp_cond_embeds = torch.sum(img_comp_cond_embeds, dim=0).unsqueeze(0)
+        elif combine_embeds == "subtract":
+            img_cond_embeds = img_cond_embeds[0] - torch.mean(img_cond_embeds[1:], dim=0)
+            img_cond_embeds = img_cond_embeds.unsqueeze(0)
+            if face_cond_embeds is not None:
+                face_cond_embeds = face_cond_embeds[0] - torch.mean(face_cond_embeds[1:], dim=0)
+                face_cond_embeds = face_cond_embeds.unsqueeze(0)
+            if img_comp_cond_embeds is not None:
+                img_comp_cond_embeds = img_comp_cond_embeds[0] - torch.mean(img_comp_cond_embeds[1:], dim=0)
+                img_comp_cond_embeds = img_comp_cond_embeds.unsqueeze(0)
+        elif combine_embeds == "average":
+            img_cond_embeds = torch.mean(img_cond_embeds, dim=0).unsqueeze(0)
+            if face_cond_embeds is not None:
+                face_cond_embeds = torch.mean(face_cond_embeds, dim=0).unsqueeze(0)
+            if img_comp_cond_embeds is not None:
+                img_comp_cond_embeds = torch.mean(img_comp_cond_embeds, dim=0).unsqueeze(0)
+        elif combine_embeds == "norm average":
+            img_cond_embeds = torch.mean(img_cond_embeds / torch.norm(img_cond_embeds, dim=0, keepdim=True), dim=0).unsqueeze(0)
+            if face_cond_embeds is not None:
+                face_cond_embeds = torch.mean(face_cond_embeds / torch.norm(face_cond_embeds, dim=0, keepdim=True), dim=0).unsqueeze(0)
+            if img_comp_cond_embeds is not None:
+                img_comp_cond_embeds = torch.mean(img_comp_cond_embeds / torch.norm(img_comp_cond_embeds, dim=0, keepdim=True), dim=0).unsqueeze(0)
+        img_uncond_embeds = img_uncond_embeds[0].unsqueeze(0) # TODO: better strategy for uncond could be to average them
+
+    if attn_mask is not None:
+        attn_mask = attn_mask.to(device, dtype=dtype)
+
+    encoder_hid_proj = None
+
+    if is_kwai_kolors_faceid and hasattr(model.model, "diffusion_model") and hasattr(model.model.diffusion_model, "encoder_hid_proj"):
+        encoder_hid_proj = model.model.diffusion_model.encoder_hid_proj.state_dict()
+
+    ipa = IPAdapter(
+        ipadapter,
+        cross_attention_dim=cross_attention_dim,
+        output_cross_attention_dim=output_cross_attention_dim,
+        clip_embeddings_dim=img_cond_embeds.shape[-1],
+        clip_extra_context_tokens=clip_extra_context_tokens,
+        is_sdxl=is_sdxl,
+        is_plus=is_plus,
+        is_full=is_full,
+        is_faceid=is_faceid,
+        is_portrait_unnorm=is_portrait_unnorm,
+        is_kwai_kolors=is_kwai_kolors,
+        encoder_hid_proj=encoder_hid_proj,
+        weight_kolors=weight_kolors
+    ).to(device, dtype=dtype)
+
+    if is_faceid and is_plus:
+        cond = ipa.get_image_embeds_faceid_plus(face_cond_embeds, img_cond_embeds, weight_faceidv2, is_faceidv2, encode_batch_size)
+        # TODO: check if noise helps with the uncond face embeds
+        uncond = ipa.get_image_embeds_faceid_plus(torch.zeros_like(face_cond_embeds), img_uncond_embeds, weight_faceidv2, is_faceidv2, encode_batch_size)
+    else:
+        cond, uncond = ipa.get_image_embeds(img_cond_embeds, img_uncond_embeds, encode_batch_size)
+        if img_comp_cond_embeds is not None:
+            cond_comp = ipa.get_image_embeds(img_comp_cond_embeds, img_uncond_embeds, encode_batch_size)[0]
+
+    cond = cond.to(device, dtype=dtype)
+    uncond = uncond.to(device, dtype=dtype)
+
+    cond_alt = None
+    if img_comp_cond_embeds is not None:
+        cond_alt = { 3: cond_comp.to(device, dtype=dtype) }
+
+    del img_cond_embeds, img_uncond_embeds, img_comp_cond_embeds, face_cond_embeds
+
+    sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+    sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+    patch_kwargs = {
+        "ipadapter": ipa,
+        "weight": weight,
+        "cond": cond,
+        "cond_alt": cond_alt,
+        "uncond": uncond,
+        "weight_type": weight_type,
+        "mask": attn_mask,
+        "sigma_start": sigma_start,
+        "sigma_end": sigma_end,
+        "unfold_batch": unfold_batch,
+        "embeds_scaling": embeds_scaling,
+    }
+
+    number = 0
+    if not is_sdxl:
+        for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
+            patch_kwargs["module_key"] = str(number*2+1)
+            set_model_patch_replace(model, patch_kwargs, ("input", id))
+            number += 1
+        for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
+            patch_kwargs["module_key"] = str(number*2+1)
+            set_model_patch_replace(model, patch_kwargs, ("output", id))
+            number += 1
+        patch_kwargs["module_key"] = str(number*2+1)
+        set_model_patch_replace(model, patch_kwargs, ("middle", 1))
+    else:
+        for id in [4,5,7,8]: # id of input_blocks that have cross attention
+            block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                set_model_patch_replace(model, patch_kwargs, ("input", id, index))
+                number += 1
+        for id in range(6): # id of output_blocks that have cross attention
+            block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                set_model_patch_replace(model, patch_kwargs, ("output", id, index))
+                number += 1
+        for index in range(10):
+            patch_kwargs["module_key"] = str(number*2+1)
+            set_model_patch_replace(model, patch_kwargs, ("middle", 1, index))
+            number += 1
+
+    # === DUAL OUTPUT: Create second model without mask ===
+    model_full = model.clone()  # Fresh clone for full-image conditioning
+
+    # Rebuild patch_kwargs with mask=None
+    patch_kwargs_full = patch_kwargs.copy()
+    patch_kwargs_full["mask"] = None
+
+    number = 0
+    if not is_sdxl:
+        for id in [1,2,4,5,7,8]:
+            patch_kwargs_full["module_key"] = str(number*2+1)
+            set_model_patch_replace(model_full, patch_kwargs_full, ("input", id))
+            number += 1
+        for id in [3,4,5,6,7,8,9,10,11]:
+            patch_kwargs_full["module_key"] = str(number*2+1)
+            set_model_patch_replace(model_full, patch_kwargs_full, ("output", id))
+            number += 1
+        patch_kwargs_full["module_key"] = str(number*2+1)
+        set_model_patch_replace(model_full, patch_kwargs_full, ("middle", 1))
+    else:
+        for id in [4,5,7,8]:
+            block_indices = range(2) if id in [4, 5] else range(10)
+            for index in block_indices:
+                patch_kwargs_full["module_key"] = str(number*2+1)
+                set_model_patch_replace(model_full, patch_kwargs_full, ("input", id, index))
+                number += 1
+        for id in range(6):
+            block_indices = range(2) if id in [3, 4, 5] else range(10)
+            for index in block_indices:
+                patch_kwargs_full["module_key"] = str(number*2+1)
+                set_model_patch_replace(model_full, patch_kwargs_full, ("output", id, index))
+                number += 1
+        for index in range(10):
+            patch_kwargs_full["module_key"] = str(number*2+1)
+            set_model_patch_replace(model_full, patch_kwargs_full, ("middle", 1, index))
+            number += 1
+
+    # === RETURN BOTH MODELS ===
+    return (model, model_full, image)  # model = with mask, model_full = no mask
+
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  Loaders
@@ -750,6 +1101,55 @@ class IPAdapterSimple:
             raise Exception("CLIPVision model not present in the pipeline. Please load the models with the IPAdapterUnifiedLoader node.")
 
         return ipadapter_execute(model.clone(), ipadapter['ipadapter']['model'], ipadapter['clipvision']['model'], **ipa_args)
+
+class IPAdapterSimpleDual:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", ),
+                "ipadapter": ("IPADAPTER", ),
+                "image": ("IMAGE",),
+                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 3, "step": 0.05 }),
+                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "weight_type": (['standard', 'prompt is more important', 'style transfer'], ),
+            },
+            "optional": {
+                "attn_mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "MODEL")
+    RETURN_NAMES = ("model_face", "model_full")
+    FUNCTION = "apply_ipadapter"
+    CATEGORY = "ipadapter"
+
+    def apply_ipadapter(self, model, ipadapter, image, weight, start_at, end_at, weight_type, attn_mask=None):
+        if weight_type.startswith("style"):
+            weight_type = "style transfer"
+        elif weight_type == "prompt is more important":
+            weight_type = "ease out"
+        else:
+            weight_type = "linear"
+
+        ipa_args = {
+            "image": image,
+            "weight": weight,
+            "start_at": start_at,
+            "end_at": end_at,
+            "attn_mask": attn_mask,
+            "weight_type": weight_type,
+            "insightface": ipadapter['insightface']['model'] if 'insightface' in ipadapter else None,
+        }
+
+        if 'ipadapter' not in ipadapter:
+            raise Exception("IPAdapter model not present in the pipeline. Please load the models with the IPAdapterUnifiedLoader node.")
+        if 'clipvision' not in ipadapter:
+            raise Exception("CLIPVision model not present in the pipeline. Please load the models with the IPAdapterUnifiedLoader node.")
+        
+        model_face, model_full, _ = ipadapter_execute_dual(model.clone(), ipadapter['ipadapter']['model'], ipadapter['clipvision']['model'], **ipa_args)
+        return (model_face, model_full)
 
 class IPAdapterAdvanced:
     def __init__(self):
@@ -1951,6 +2351,7 @@ class IPAdapterCombineParams:
 NODE_CLASS_MAPPINGS = {
     # Main Apply Nodes
     "IPAdapter": IPAdapterSimple,
+    "IPAdapterDual": IPAdapterSimpleDual,
     "IPAdapterAdvanced": IPAdapterAdvanced,
     "IPAdapterBatch": IPAdapterBatch,
     "IPAdapterFaceID": IPAdapterFaceID,
@@ -1996,6 +2397,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     # Main Apply Nodes
     "IPAdapter": "IPAdapter",
+    "IPAdapterDual": "IPAdapterDual",
     "IPAdapterAdvanced": "IPAdapter Advanced",
     "IPAdapterBatch": "IPAdapter Batch (Adv.)",
     "IPAdapterFaceID": "IPAdapter FaceID",
